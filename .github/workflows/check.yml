@@ -1,132 +1,195 @@
 name: VPN Gate Node Check
 
-# 模板仓库默认不配置定时任务：需要自动更新时，把下面的注释替换成你自己的 cron。
-# 注意：GitHub 调度最小间隔约 5 分钟，但通常会延迟几分钟；仓库连续 60 天无提交会让定时任务自动停用。
-#
-# on:
-#   schedule:
-#     - cron: '*/30 * * * *'
-
 on:
-  # 定时检测: 默认每 30 分钟一次。改成每 60 分钟: cron: "0 * * * *"
+  # 如需每 30 分钟自动运行，取消下面两行的注释：
   # schedule:
-  #  - cron: "0 0 * * *"
+  #   - cron: "*/30 * * * *"
+
   workflow_dispatch:
     inputs:
       max_nodes:
-        description: '最多检测多少个节点（0 = 全部）'
+        description: "最多检测多少个节点（0 = 全部）"
         required: false
-        default: '0'
+        default: "0"
+        type: string
+
       concurrency:
-        description: '并发数（建议 16–32）'
+        description: "并发数（建议 16-32）"
         required: false
-        default: '32'
+        default: "32"
+        type: string
+
       timeout:
-        description: '单节点检测超时（秒）'
+        description: "单节点检测超时（秒）"
         required: false
-        default: '25'
+        default: "25"
+        type: string
 
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-
+# 防止多个检测和部署任务同时运行。
+# 新任务不会取消正在进行的部署。
 concurrency:
-  group: gate-check
+  group: vpn-gate-pages
   cancel-in-progress: false
 
+# 默认只开放读取仓库内容的权限。
+permissions:
+  contents: read
+
 jobs:
-  check:
+  build:
+    name: Check nodes and build Pages
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
           cache: pip
+          cache-dependency-path: requirements.txt
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
 
-      - name: Validate worker secret
+      - name: Validate inputs and worker secret
         env:
           DOMAIN: ${{ secrets.DOMAIN }}
+          CHECK_CONCURRENCY: ${{ inputs.concurrency || '32' }}
+          CHECK_TIMEOUT: ${{ inputs.timeout || '25' }}
+          MAX_CHECK_NODES: ${{ inputs.max_nodes || '0' }}
         run: |
+          set -euo pipefail
+
           if [ -z "${DOMAIN}" ]; then
-            echo "::error::未配置检测地址。请在仓库 Settings → Secrets and variables → Actions 中新增 Secret：DOMAIN（只填 Worker 的 host，例如 abc.workers.dev）"
+            echo "::error::未配置 DOMAIN。请进入仓库 Settings -> Secrets and variables -> Actions，新增名为 DOMAIN 的 Repository secret。"
             exit 1
           fi
-          echo "检测域名已配置：${DOMAIN}"
 
-      - name: Run pipeline
-        env:
-          CHECK_WORKER: "https://${{ secrets.DOMAIN }}/check?sstp=vpn:vpn@"
-          CHECK_CONCURRENCY: ${{ github.event.inputs.concurrency || '32' }}
-          CHECK_TIMEOUT: ${{ github.event.inputs.timeout || '25' }}
-          MAX_CHECK_NODES: ${{ github.event.inputs.max_nodes || '0' }}
-          MIN_SUCCESS_RATIO: '0'
-        run: python vpngate.py
+          case "${DOMAIN}" in
+            http://*|https://*|*/*)
+              echo "::error::DOMAIN 只能填写主机名，例如 abc.workers.dev，不能包含协议、路径或结尾斜杠。"
+              exit 1
+              ;;
+          esac
 
-      - name: Ensure GitHub Pages is enabled
+          if ! printf '%s' "${CHECK_CONCURRENCY}" | grep -Eq '^[0-9]+$'; then
+            echo "::error::concurrency 必须是正整数。"
+            exit 1
+          fi
+
+          if [ "${CHECK_CONCURRENCY}" -lt 1 ] || [ "${CHECK_CONCURRENCY}" -gt 128 ]; then
+            echo "::error::concurrency 必须在 1-128 之间，建议使用 16-32。"
+            exit 1
+          fi
+
+          if ! printf '%s' "${CHECK_TIMEOUT}" | grep -Eq '^[0-9]+$'; then
+            echo "::error::timeout 必须是正整数。"
+            exit 1
+          fi
+
+          if [ "${CHECK_TIMEOUT}" -lt 1 ] || [ "${CHECK_TIMEOUT}" -gt 300 ]; then
+            echo "::error::timeout 必须在 1-300 秒之间。"
+            exit 1
+          fi
+
+          if ! printf '%s' "${MAX_CHECK_NODES}" | grep -Eq '^[0-9]+$'; then
+            echo "::error::max_nodes 必须是大于或等于 0 的整数。"
+            exit 1
+          fi
+
+          echo "DOMAIN 已配置并通过格式检查。"
+          echo "并发数：${CHECK_CONCURRENCY}"
+          echo "单节点超时：${CHECK_TIMEOUT} 秒"
+          echo "最大检测节点数：${MAX_CHECK_NODES}"
+
+      - name: Run VPN Gate pipeline
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHECK_WORKER: https://${{ secrets.DOMAIN }}/check?sstp=vpn:vpn@
+          CHECK_CONCURRENCY: ${{ inputs.concurrency || '32' }}
+          CHECK_TIMEOUT: ${{ inputs.timeout || '25' }}
+          MAX_CHECK_NODES: ${{ inputs.max_nodes || '0' }}
+          MIN_SUCCESS_RATIO: "0"
         run: |
-          set -u
-          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/pages"
-          auth=(-H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json")
+          set -euo pipefail
+          python vpngate.py
 
-          status=$(curl -sS -o /tmp/pages.json -w '%{http_code}' "${auth[@]}" "${api}")
-          echo "GET ${api} -> ${status}"
+      - name: Validate Pages output
+        run: |
+          set -euo pipefail
 
-          if [ "${status}" = "200" ]; then
-            echo "GitHub Pages 已启用"
-            exit 0
+          if [ ! -d "public" ]; then
+            echo "::error::public 目录不存在。请确认 vpngate.py 会将网站文件写入 public 目录。"
+            exit 1
           fi
 
-          if [ "${status}" = "404" ]; then
-            # 创建站点必须用 POST，且 workflow 构建类型不接受 source 字段
-            create=$(curl -sS -o /tmp/pages-create.json -w '%{http_code}' -X POST \
-              "${auth[@]}" -H "Content-Type: application/json" \
-              -d '{"build_type":"workflow"}' "${api}")
-            echo "POST ${api} -> ${create}"
-            case "${create}" in
-              201|204|409)
-                echo "GitHub Pages 已启用（或已存在），等待生效"
-                sleep 10
-                exit 0
-                ;;
-              *)
-                echo "::error::自动启用 Pages 失败（HTTP ${create}）。请打开仓库 Settings → Pages，把 Source 选为 GitHub Actions，然后重新运行本工作流。"
-                cat /tmp/pages-create.json 2>/dev/null || true
-                exit 1
-                ;;
-            esac
+          file_count=$(find public -type f | wc -l)
+          echo "public 目录文件数量：${file_count}"
+
+          if [ "${file_count}" -eq 0 ]; then
+            echo "::error::public 目录为空，没有可部署的文件。"
+            exit 1
           fi
 
-          echo "::error::查询 Pages 状态失败（HTTP ${status}），请检查仓库 Pages 设置或工作流权限。"
-          cat /tmp/pages.json 2>/dev/null || true
-          exit 1
+          echo "准备部署的文件："
+          find public -maxdepth 3 -type f -print | sort
 
-      - name: Setup Pages
+          if [ ! -f "public/index.html" ]; then
+            echo "::warning::public/index.html 不存在，Pages 网站根地址可能返回 404。"
+          fi
+
+          if [ ! -f "public/nodes.txt" ]; then
+            echo "::warning::public/nodes.txt 不存在，节点订阅地址可能返回 404。"
+          fi
+
+      - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
 
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v4
         with:
-          path: public
+          path: ./public
 
+  deploy:
+    name: Deploy GitHub Pages
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # 只有 build 成功并上传 Artifact 后，才开始部署。
+    needs: build
+
+    permissions:
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
 
-      - name: Show site URL
+      - name: Show deployment information
+        env:
+          PAGE_URL: ${{ steps.deployment.outputs.page_url }}
         run: |
-          echo "订阅地址：https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/nodes.txt"
-          echo "仪表盘：  https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/"
+          set -euo pipefail
+
+          echo "部署成功。"
+          echo "仪表盘：${PAGE_URL}"
+          echo "订阅地址：${PAGE_URL}nodes.txt"
+
+          {
+            echo "## GitHub Pages 部署成功"
+            echo
+            echo "- 仪表盘：${PAGE_URL}"
+            echo "- 订阅地址：${PAGE_URL}nodes.txt"
+          } >> "${GITHUB_STEP_SUMMARY}"
